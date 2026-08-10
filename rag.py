@@ -1,109 +1,183 @@
-import chromadb
+import os
+from dotenv import load_dotenv
+from qdrant_client import QdrantClient
+from sentence_transformers import SentenceTransformer
 import ollama
 
-client = chromadb.PersistentClient(
-    path="./chroma_db"
+load_dotenv()
+
+# Config
+COLLECTION = "pdf_knowledge"
+MODEL = "gemma3:1b"
+TOP_K = 10
+THRESHOLD = 0.60
+MAX_CONTEXT = 6
+
+# Environment
+url = os.getenv("QDRANT_URL")
+key = os.getenv("QDRANT_API_KEY")
+
+if not url or not key:
+    raise ValueError("QDRANT_URL or QDRANT_API_KEY is missing")
+
+# Connections
+qdrant = QdrantClient(
+    url=url,
+    api_key=key,
+    timeout=60
 )
 
-collection = client.get_collection(
-    "pdf_knowledge"
-)
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
 
-def retrieve(query, k=15):
+def retrieve(query):
+    vector = embedder.encode(
+        query,
+        normalize_embeddings=True
+    ).tolist()
 
-    query_embedding = ollama.embeddings(
-        model="nomic-embed-text",
-        prompt=query
-    )["embedding"]
+    results = qdrant.query_points(
+        collection_name=COLLECTION,
+        query=vector,
+        limit=TOP_K,
+        with_payload=True,
+        with_vectors=False
+    ).points
 
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=k
-    )
-
-    return results
+    return [
+        r for r in results
+        if r.score >= THRESHOLD
+    ][:MAX_CONTEXT]
 
 
 def generate_answer(query):
-
     results = retrieve(query)
 
-    documents = results["documents"][0]
-    metadata = results["metadatas"][0]
-
-    context = "\n\n".join(documents)
-
-    prompt = f"""
-You are a helpful AI assistant.
-
-Answer ONLY from the supplied context.
-
-If the answer is partially present,
-provide the best possible answer.
-
-Context:
-{context}
-
-Question:
-{query}
-
-Answer:
-"""
-
-    response = ollama.generate(
-        model="gemma3:1b",
-        prompt=prompt
-    )
-
-    answer = response["response"]
-
-    citations = []
-
-    seen = set()
-
-    for meta in metadata:
-
-        source = (
-            f"{meta['file']} "
-            f"(Page {meta['page']})"
+    if not results:
+        return (
+            "I couldn't find this information in the "
+            "uploaded PDF documents.",
+            [],
+            []
         )
 
+    context = []
+    citations = []
+    documents = []
+    seen = set()
+
+    for r in results:
+        data = r.payload or {}
+        text = data.get("text", "")
+        file = data.get("file", "Unknown file")
+        page = data.get("page", "Unknown page")
+
+        if not text:
+            continue
+
+        context.append(
+            f"PDF: {file}\n"
+            f"Page: {page}\n"
+            f"Content:\n{text}"
+        )
+
+        documents.append(text)
+
+        source = f"{file} (Page {page})"
+
         if source not in seen:
-
             citations.append(source)
-
             seen.add(source)
 
-    return (
-        answer,
-        citations,
-        documents
-    )
+    if not context:
+        return (
+            "I couldn't find this information in the "
+            "uploaded PDF documents.",
+            [],
+            []
+        )
+
+    prompt = f"""
+You are a strict PDF question-answering assistant.
+
+Answer ONLY from the PDF context below.
+
+Rules:
+- Do not use outside knowledge.
+- Do not use internet knowledge.
+- Do not guess.
+- Do not invent information.
+- Every factual statement must be supported by the PDFs.
+- If the answer is not supported, reply exactly:
+
+I couldn't find this information in the uploaded PDF documents.
+
+PDF CONTEXT:
+{"".join(context)}
+
+QUESTION:
+{query}
+
+ANSWER:
+"""
+
+    try:
+        response = ollama.generate(
+            model=MODEL,
+            prompt=prompt,
+            options={"temperature": 0}
+        )
+
+        answer = response["response"].strip()
+
+    except Exception as e:
+        return f"Ollama error: {e}", [], []
+
+    if "couldn't find this information" in answer.lower():
+        return (
+            "I couldn't find this information in the "
+            "uploaded PDF documents.",
+            [],
+            []
+        )
+
+    return answer, citations, documents
 
 
 if __name__ == "__main__":
 
+    print("\n📚 PDF RAG Chatbot")
+    print("Type 'exit' to quit.\n")
+
     while True:
 
-        question = input(
-            "\nAsk a question (exit to quit): "
-        )
+        question = input("Ask a question: ").strip()
 
         if question.lower() == "exit":
             break
 
-        answer, citations, docs = generate_answer(
-            question
-        )
+        if not question:
+            print("Please enter a question.")
+            continue
 
-        print("\nANSWER\n")
+        print("\nSearching your PDF documents...")
 
-        print(answer)
+        try:
+            answer, citations, docs = generate_answer(question)
 
-        print("\nSOURCES\n")
+            print("\nANSWER\n")
+            print(answer)
 
-        for c in citations:
-            print("-", c)
+            print("\nSOURCES\n")
+
+            if citations:
+                for citation in citations:
+                    print("-", citation)
+            else:
+                print("No relevant PDF source found.")
+
+        except Exception as e:
+            print("\nERROR:", e)
+
 
             

@@ -1,54 +1,82 @@
 import streamlit as st
-
 from rag import generate_answer
 
 st.set_page_config(
     page_title="PDF RAG Chatbot",
+    page_icon="📚",
     layout="wide"
 )
 
 st.title("📚 PDF RAG Chatbot")
 
-query = st.text_input(
-    "Ask a question from your PDFs"
+st.write(
+    "Ask questions about your uploaded PDF documents."
 )
 
-if st.button("Search"):
+query = st.text_input(
+    "Ask a question",
+    placeholder="Example: What is machine learning?"
+)
+
+if st.button("🔍 Search", type="primary"):
 
     if not query.strip():
 
-        st.warning(
-            "Please enter a question."
-        )
+        st.warning("Please enter a question.")
 
     else:
 
         with st.spinner(
-            "Searching documents..."
+            "Searching your PDF documents..."
         ):
 
-            answer, citations, docs = (
-                generate_answer(query)
-            )
+            try:
 
-        st.subheader("Answer")
+                answer, citations, documents = (
+                    generate_answer(query)
+                )
 
-        st.write(answer)
+                st.subheader("💡 Answer")
 
-        st.subheader("Sources")
+                st.write(answer)
 
-        for c in citations:
+                st.subheader("📄 Sources")
 
-            st.write("•", c)
+                if citations:
 
-        st.subheader(
-            "Retrieved Chunks"
-        )
+                    for citation in citations:
+                        st.write(f"• {citation}")
 
-        for i, doc in enumerate(docs):
+                else:
 
-            with st.expander(
-                f"Chunk {i+1}"
-            ):
+                    st.info(
+                        "No relevant PDF source found."
+                    )
 
-                st.write(doc)
+                if documents:
+
+                    with st.expander(
+                        "🔎 Retrieved PDF Content"
+                    ):
+
+                        for i, document in enumerate(
+                            documents
+                        ):
+
+                            st.markdown(
+                                f"**Chunk {i + 1}**"
+                            )
+
+                            st.write(document)
+
+            except Exception as e:
+
+                st.error(
+                    "An error occurred while "
+                    "processing your question."
+                )
+
+                st.exception(e)
+
+
+                
