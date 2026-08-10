@@ -4,5 +4,5 @@ sentence-transformers
 pymupdf
 pytesseract
 Pillow
-ollama
 python-dotenv
+groq
