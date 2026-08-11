@@ -1,234 +1,233 @@
 import os
-import uuid
-import fitz
-
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
 from sentence_transformers import SentenceTransformer
-
-
-# ---------------- CONFIG ----------------
+import ollama
 
 load_dotenv()
 
-PDF_FOLDER = "data"
+
 COLLECTION_NAME = "pdf_knowledge"
-MODEL_NAME = "all-MiniLM-L6-v2"
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
-VECTOR_SIZE = 384
-CHUNK_SIZE = 2000
-CHUNK_OVERLAP = 300
-
-
-# ---------------- ENV ----------------
+TOP_K = 15
+SIMILARITY_THRESHOLD = 0.55
+MAX_CONTEXT_CHUNKS = 6
 
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
 if not QDRANT_URL or not QDRANT_API_KEY:
-    raise ValueError(
-        "QDRANT_URL or QDRANT_API_KEY is missing from .env"
-    )
-
-if not os.path.exists(PDF_FOLDER):
-    raise FileNotFoundError(
-        f"PDF folder not found: {PDF_FOLDER}"
-    )
+    raise ValueError("Qdrant credentials are missing from .env")
 
 
-# ---------------- QDRANT ----------------
-
-print("\nConnecting to Qdrant...")
-
-client = QdrantClient(
+qdrant = QdrantClient(
     url=QDRANT_URL,
     api_key=QDRANT_API_KEY
 )
 
-print("✓ Qdrant connected")
-
-
-# ---------------- EMBEDDING MODEL ----------------
-
-print("Loading embedding model...")
-
-model = SentenceTransformer(MODEL_NAME)
-
-print("✓ Model loaded")
-
-
-# ---------------- COLLECTION ----------------
-
-collections = client.get_collections().collections
-
-if any(c.name == COLLECTION_NAME for c in collections):
-    print(f"Deleting old collection: {COLLECTION_NAME}")
-    client.delete_collection(COLLECTION_NAME)
-
-client.create_collection(
-    collection_name=COLLECTION_NAME,
-    vectors_config=VectorParams(
-        size=VECTOR_SIZE,
-        distance=Distance.COSINE
-    )
+embedding_model = SentenceTransformer(
+    EMBEDDING_MODEL
 )
 
-print(f"✓ Collection ready: {COLLECTION_NAME}")
 
+def retrieve(query):
 
-# ---------------- CHUNKING ----------------
-
-def chunk_text(text):
-    chunks = []
-
-    step = CHUNK_SIZE - CHUNK_OVERLAP
-
-    for start in range(0, len(text), step):
-        chunk = text[start:start + CHUNK_SIZE].strip()
-
-        if chunk:
-            chunks.append(chunk)
-
-        if start + CHUNK_SIZE >= len(text):
-            break
-
-    return chunks
-
-
-# ---------------- EMBEDDING ----------------
-
-def create_embedding(text):
-    return model.encode(
-        text,
+    query_vector = embedding_model.encode(
+        query,
         normalize_embeddings=True
     ).tolist()
 
-
-# ---------------- PDF FILES ----------------
-
-pdf_files = [
-    f for f in os.listdir(PDF_FOLDER)
-    if f.lower().endswith(".pdf")
-]
-
-if not pdf_files:
-    raise FileNotFoundError(
-        f"No PDF files found in '{PDF_FOLDER}'"
+    results = qdrant.query_points(
+        collection_name=COLLECTION_NAME,
+        query=query_vector,
+        limit=TOP_K,
+        with_payload=True,
+        with_vectors=False
     )
 
+    relevant = []
 
-# ---------------- INGESTION ----------------
+    for point in results.points:
 
-total_pdfs = 0
-total_pages = 0
-total_chunks = 0
-failed_chunks = 0
+        score = point.score
 
-print(f"\nFound {len(pdf_files)} PDF files.\n")
+        if score < SIMILARITY_THRESHOLD:
+            continue
 
+        payload = point.payload or {}
 
-for pdf_file in pdf_files:
+        text = payload.get("text", "")
 
-    pdf_path = os.path.join(
-        PDF_FOLDER,
-        pdf_file
+        if not text.strip():
+            continue
+
+        relevant.append({
+            "text": text,
+            "file": payload.get("file", "Unknown"),
+            "page": payload.get("page", "Unknown"),
+            "score": score
+        })
+
+    relevant.sort(
+        key=lambda x: x["score"],
+        reverse=True
     )
 
-    print(f"Processing {pdf_file}")
+    return relevant[:MAX_CONTEXT_CHUNKS]
 
-    try:
 
-        doc = fitz.open(pdf_path)
-        total_pdfs += 1
 
-        for page_index, page in enumerate(doc):
+def generate_answer(query):
 
-            page_number = page_index + 1
-            total_pages += 1
+    results = retrieve(query)
 
-            text = page.get_text().strip()
-
-            if not text:
-                continue
-
-            chunks = chunk_text(text)
-
-            print(
-                f"  Page {page_number}: "
-                f"{len(chunks)} chunk(s)"
-            )
-
-            for chunk_id, chunk in enumerate(chunks):
-
-                try:
-
-                    embedding = create_embedding(chunk)
-
-                    point_id = str(
-                        uuid.uuid5(
-                            uuid.NAMESPACE_URL,
-                            f"{pdf_file}_"
-                            f"{page_number}_"
-                            f"{chunk_id}"
-                        )
-                    )
-
-                    point = PointStruct(
-                        id=point_id,
-                        vector=embedding,
-                        payload={
-                            "text": chunk,
-                            "file": pdf_file,
-                            "page": page_number,
-                            "chunk_id": chunk_id
-                        }
-                    )
-
-                    client.upsert(
-                        collection_name=COLLECTION_NAME,
-                        points=[point]
-                    )
-
-                    total_chunks += 1
-
-                except Exception as e:
-
-                    failed_chunks += 1
-
-                    print(
-                        f"    ✗ Chunk "
-                        f"{chunk_id + 1}: {e}"
-                    )
-
-        doc.close()
-
-    except Exception as e:
-
-        print(
-            f"  ✗ Error: {e}"
+    if not results:
+        return (
+            "I couldn't find this information in the "
+            "uploaded PDF documents.",
+            [],
+            []
         )
 
+    context = []
 
-# ---------------- RESULT ----------------
+    for i, item in enumerate(results):
 
-print("\n" + "=" * 55)
-print("INGESTION COMPLETE")
-print("=" * 55)
+        context.append(
+            f"""
+SOURCE {i + 1}
+File: {item["file"]}
+Page: {item["page"]}
 
-print(f"PDF files processed : {total_pdfs}")
-print(f"Pages processed     : {total_pages}")
-print(f"Chunks uploaded     : {total_chunks}")
-print(f"Failed chunks       : {failed_chunks}")
-print(f"Qdrant collection   : {COLLECTION_NAME}")
+Content:
+{item["text"]}
+"""
+        )
 
-print("=" * 55)
+    context_text = "\n".join(context)
 
-if failed_chunks == 0:
-    print("\n✓ All PDF chunks uploaded successfully.")
-else:
-    print(
-        f"\n⚠ {failed_chunks} chunks failed."
+    prompt = f"""
+You are a strict PDF question-answering assistant.
+
+Use ONLY the information contained in the PDF context below.
+
+Rules:
+- Do not use outside knowledge.
+- Do not use internet knowledge.
+- Do not guess.
+- Do not assume missing information.
+- Answer only when the context supports the answer.
+- If the answer is not supported by the context, respond exactly:
+
+I couldn't find this information in the uploaded PDF documents.
+
+Keep the answer clear and concise.
+
+PDF CONTEXT:
+{context_text}
+
+QUESTION:
+{query}
+
+ANSWER:
+"""
+
+    response = ollama.generate(
+        model="gemma3:1b",
+        prompt=prompt,
+        options={
+            "temperature": 0
+        }
     )
 
-print("\nNext step: python rag.py")
+    answer = response["response"].strip()
+
+    not_found = (
+        "I couldn't find this information in the "
+        "uploaded PDF documents."
+    )
+
+    if not_found.lower() in answer.lower():
+
+        return (
+            not_found,
+            [],
+            []
+        )
+
+    citations = []
+    seen = set()
+    documents = []
+
+    for item in results:
+
+        source = (
+            f'{item["file"]} '
+            f'(Page {item["page"]})'
+        )
+
+        if source not in seen:
+
+            citations.append(source)
+            seen.add(source)
+
+        documents.append(item["text"])
+
+    return (
+        answer,
+        citations,
+        documents
+    )
+
+
+
+if __name__ == "__main__":
+
+    while True:
+
+        question = input(
+            "\nAsk a question (exit to quit): "
+        ).strip()
+
+        if question.lower() == "exit":
+            print("\nExiting...")
+            break
+
+        if not question:
+            print("\nPlease enter a question.")
+            continue
+
+        print("\nSearching your PDF documents...")
+
+        try:
+
+            answer, citations, docs = generate_answer(
+                question
+            )
+
+            print("\n" + "=" * 50)
+            print("ANSWER")
+            print("=" * 50)
+
+            print(answer)
+
+            print("\n" + "=" * 50)
+            print("SOURCES")
+            print("=" * 50)
+
+            if citations:
+
+                for citation in citations:
+                    print("-", citation)
+
+            else:
+                print("No relevant PDF sources found.")
+
+        except Exception as e:
+
+            print("\nERROR:", e)
+
+
+
+            
